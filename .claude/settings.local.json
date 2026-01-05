@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.kimai.org)",
+      "WebFetch(domain:demo.kimai.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl:*)",
+      "Bash(python:*)",
+      "Bash(cat:*)",
+      "Bash(echo:*)",
+      "Bash(powershell -Command \"Rename-Item -Path ''D:\\\\dev\\\\AI_Bridge\\\\kimay'' -NewName ''nectime''\")"
+    ]
+  }
+}

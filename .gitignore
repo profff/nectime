@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+
+# Data (contient credentials et logs perso)
+data/
+config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp

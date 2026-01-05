@@ -1,0 +1,20 @@
+{
+    "kimai_url": "http://kimai.texys.local",
+    "auth_user": "your.email@company.com",
+    "auth_token": "YOUR_API_TOKEN",
+
+    "daily_limit_hours": 8,
+    "dry_run": true,
+
+    "activity_mappings": {
+        "dev_embarque": {"id": 16, "name": "Développement Software Embarqué"},
+        "dev_applicatif": {"id": 17, "name": "Développement Software Applicatif"},
+        "cablage": {"id": 19, "name": "Câblage/Prototypage"},
+        "doc": {"id": 20, "name": "Documentation"},
+        "conception_elec": {"id": 26, "name": "Conception électronique"},
+        "reunion": {"id": 34, "name": "Réunion"},
+        "amelioration": {"id": 41, "name": "Customisation/Amélioration Continues"}
+    },
+
+    "default_activity": "dev_applicatif"
+}
