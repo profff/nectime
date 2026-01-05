@@ -1,0 +1,37 @@
+{
+    "_comment": "Ajouter cette section 'hooks' dans ~/.claude/settings.json",
+    "_note": "Adapter le chemin vers hook_wrapper.py selon votre installation",
+
+    "hooks": {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
+                    }
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
+                    }
+                ]
+            }
+        ],
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
+                    }
+                ]
+            }
+        ]
+    }
+}

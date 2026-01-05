@@ -1,5 +1,5 @@
 {
-    "kimai_url": "http://kimai.texys.local",
+    "kimai_url": "http://kimai.example.com",
     "auth_user": "your.email@company.com",
     "auth_token": "YOUR_API_TOKEN",
 
@@ -9,12 +9,34 @@
     "activity_mappings": {
         "dev_embarque": {"id": 16, "name": "Développement Software Embarqué"},
         "dev_applicatif": {"id": 17, "name": "Développement Software Applicatif"},
-        "cablage": {"id": 19, "name": "Câblage/Prototypage"},
         "doc": {"id": 20, "name": "Documentation"},
         "conception_elec": {"id": 26, "name": "Conception électronique"},
-        "reunion": {"id": 34, "name": "Réunion"},
-        "amelioration": {"id": 41, "name": "Customisation/Amélioration Continues"}
+        "reunion": {"id": 34, "name": "Réunion"}
     },
 
-    "default_activity": "dev_applicatif"
+    "default_activity": "dev_applicatif",
+
+    "auto_activity": {
+        "enabled": true,
+        "interval_minutes": 20,
+        "ask_before_change": false,
+        "rules": {
+            "dev_embarque": {
+                "extensions": [".c", ".h", ".s", ".ld", ".map"],
+                "keywords": ["firmware", "bootloader", "stm32", "hal", "driver", "uart", "spi", "i2c", "gpio"]
+            },
+            "dev_applicatif": {
+                "extensions": [".py", ".js", ".ts", ".cs", ".json", ".yaml", ".yml", ".sh", ".bat", ".ps1"],
+                "keywords": ["python", "script", "api", "server", "client", "database"]
+            },
+            "doc": {
+                "extensions": [".md", ".rst", ".txt"],
+                "keywords": ["readme", "documentation", "doc", "manual"]
+            },
+            "conception_elec": {
+                "extensions": [".sch", ".brd", ".kicad_pcb", ".kicad_sch"],
+                "keywords": ["schematic", "pcb", "kicad", "altium", "circuit"]
+            }
+        }
+    }
 }

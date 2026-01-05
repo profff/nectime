@@ -27,49 +27,25 @@ Remplir :
 - `auth_token` : Token API (Kimai > Profil > API)
 - `activity_mappings` : Mapping des activités (récupérer les IDs via `nectime activities`)
 
+Voir `config.example.json` pour un exemple complet avec l'auto-estimation d'activité.
+
 ### 2. Hooks Claude Code
 
-Ajouter dans `~/.claude/settings.json` :
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python D:\\dev\\AI_Bridge\\nectime\\hook_wrapper.py"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+Ajouter la section `hooks` dans `~/.claude/settings.json`.
+
+Voir `claude-hooks.example.json` pour le template, adapter le chemin vers `hook_wrapper.py`.
 
 ### 3. Skill Claude Code (optionnel)
 
 Pour utiliser `/nectime` dans Claude Code, ajouter le skill dans `.claude/settings.json` du projet ou global.
+
+## Fichiers de configuration
+
+| Fichier | Description |
+|---------|-------------|
+| `config.json` | Configuration locale (Kimai, activités, auto-estimation) |
+| `config.example.json` | Template de configuration |
+| `claude-hooks.example.json` | Template des hooks pour `~/.claude/settings.json` |
 
 ## Types de projets
 
