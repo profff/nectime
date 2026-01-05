@@ -1,12 +1,13 @@
 #!python3
 """
 Hook wrapper pour Claude Code
-- SessionStart: démarre session (gère orphelines)
+- SessionStart: demarre session (gere orphelines via cleanup)
 - SessionEnd: termine session
-- UserPromptSubmit: met à jour last_activity
+- UserPromptSubmit: met a jour last_activity
 """
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,7 @@ from nectime import (
 
 
 def format_duration(minutes: int) -> str:
-    """Formate une durée en heures:minutes"""
+    """Formate une duree en heures:minutes"""
     h, m = divmod(minutes, 60)
     return f"{h}h{m:02d}"
 
@@ -35,60 +36,24 @@ def output_message(message: str):
     print(message, file=sys.stderr)
 
 
-def close_orphan_session(sm: SessionManager, logger: LocalLogger, config: dict) -> str:
-    """Ferme une session orpheline et retourne un message"""
-    if not sm.is_active():
-        return None
-
-    # Vérifier si la session est orpheline (d'un autre jour ou > 12h)
-    begin = datetime.fromisoformat(sm.session["begin"])
-    last_activity = datetime.fromisoformat(sm.session["last_activity"])
-    now = datetime.now()
-
-    # Orpheline si: autre jour OU plus de 12h depuis le début
-    is_orphan = (begin.date() != now.date()) or ((now - begin).total_seconds() > 12 * 3600)
-
-    if not is_orphan:
-        return None
-
-    # Fermer avec last_activity comme heure de fin
-    session_data = sm.session.copy()
-    session_data["end"] = last_activity.isoformat()
-
-    # Calculer les durées
-    session_data["billed_minutes"] = int((last_activity - begin).total_seconds() / 60)
-    session_data["real_minutes"] = session_data["billed_minutes"]
-
-    # Activité par défaut
-    activity = config.get("default_activity", "dev_applicatif")
-    session_data["activity"] = activity
-
-    # Logger localement (pas de push pour les orphelines)
-    logger.add_entry(session_data, pushed_to_kimai=False)
-
-    # Supprimer la session
-    sm.session = None
-    sm._save()
-
-    duration = format_duration(session_data["billed_minutes"])
-    return f"Session orpheline fermee: {session_data.get('project_name')} ({duration}) du {begin.strftime('%d/%m %H:%M')}"
-
-
-def start_session(cwd: str):
-    """Démarre une session (gère les orphelines)"""
+def start_session(cwd: str, session_id: str):
+    """Demarre une session (ferme les anciennes d'abord)"""
     config = load_config()
-    sm = SessionManager()
+    sm = SessionManager(folder=cwd, session_id=session_id)
     logger = LocalLogger()
 
-    # Gérer les sessions orphelines
-    orphan_msg = close_orphan_session(sm, logger, config)
+    # Fermer les sessions anciennes (> 12h ou jour different)
+    closed = sm.cleanup_old_sessions(logger=logger, config=config)
+    cleanup_msg = ""
+    if closed:
+        total_mins = sum(c.get("billed_minutes", 0) for c in closed)
+        h, m = divmod(total_mins, 60)
+        cleanup_msg = f" [{len(closed)} ancienne(s) fermee(s): {h}h{m:02d}]"
 
-    # Si session encore active (pas orpheline), juste informer
+    # Si session deja active pour ce session_id, juste informer
     if sm.is_active():
         status = sm.status()
-        msg = f"NECTIME: Session deja active - {status['project_name']} ({format_duration(status['elapsed_minutes'])})"
-        if orphan_msg:
-            msg = f"NECTIME: {orphan_msg} | Nouvelle session..."
+        msg = f"NECTIME: Session active - {status['project_name']} ({format_duration(status['elapsed_minutes'])}){cleanup_msg}"
         output_message(msg)
         return
 
@@ -101,19 +66,15 @@ def start_session(cwd: str):
         project_name = mapping.get("project_name", "Unknown")
 
         if folder_type == "off":
-            msg = f"NECTIME: Dossier ignore"
-            if orphan_msg:
-                msg = f"NECTIME: {orphan_msg}"
+            msg = f"NECTIME: Dossier ignore{cleanup_msg}"
             output_message(msg)
             return
 
-        # Démarrer la session
-        sm.start(cwd, folder_type, project_id, project_name)
+        # Demarrer la session
+        sm.start(folder_type, project_id, project_name)
 
         type_label = {"pro": "Kimai", "perso": "local", "pending": "en attente"}
-        msg = f"NECTIME: Session demarree - {project_name} ({type_label.get(folder_type, folder_type)})"
-        if orphan_msg:
-            msg = f"NECTIME: {orphan_msg} | {msg[7:]}"
+        msg = f"NECTIME: Session demarree - {project_name} ({type_label.get(folder_type, folder_type)}){cleanup_msg}"
         output_message(msg)
 
     else:
@@ -147,34 +108,32 @@ def start_session(cwd: str):
             matches = []
 
         folder_name = Path(cwd).name
-        sm.start(cwd, "pending", None, folder_name)
+        sm.start("pending", None, folder_name)
 
         if matches:
             match_str = ", ".join([f"{p['name']} (id={p['id']})" for p in matches[:2]])
-            msg = f"NECTIME: Nouveau dossier '{folder_name}' - Projets similaires: {match_str} - /nectime set pro <id>"
+            msg = f"NECTIME: Nouveau dossier '{folder_name}' - Projets similaires: {match_str} - /nectime set pro <id>{cleanup_msg}"
         else:
-            msg = f"NECTIME: Nouveau dossier '{folder_name}' - Aucun projet similaire - /nectime projects"
+            msg = f"NECTIME: Nouveau dossier '{folder_name}' - Aucun projet similaire - /nectime projects{cleanup_msg}"
 
-        if orphan_msg:
-            msg = f"NECTIME: {orphan_msg} | {msg[7:]}"
         output_message(msg)
 
 
-def stop_session():
-    """Arrête la session (log local uniquement, jamais de push auto)"""
+def stop_session(cwd: str, session_id: str):
+    """Arrete la session (log local uniquement, jamais de push auto)"""
     config = load_config()
-    sm = SessionManager()
+    sm = SessionManager(folder=cwd, session_id=session_id)
     logger = LocalLogger()
 
     if not sm.is_active():
         return
 
     session_data = sm.stop()
-    # Utiliser l'activité définie pendant la session, sinon la valeur par défaut
+    # Utiliser l'activite definie pendant la session, sinon la valeur par defaut
     activity = session_data.get("current_activity_estimate") or config.get("default_activity", "dev_applicatif")
     session_data["activity"] = activity
 
-    # Récupérer les commits git de la session
+    # Recuperer les commits git de la session
     folder = session_data.get("folder")
     if folder:
         commits = get_git_commits(
@@ -202,16 +161,17 @@ def stop_session():
     output_message(msg)
 
 
-def update_activity():
-    """Met à jour last_activity (appelé à chaque message)"""
-    sm = SessionManager()
+def update_activity(cwd: str, session_id: str):
+    """Met a jour last_activity (appele a chaque message)"""
+    sm = SessionManager(folder=cwd, session_id=session_id)
 
     if not sm.is_active():
         return
 
-    # Mettre à jour le timestamp
-    sm.session["last_activity"] = datetime.now().isoformat()
-    sm._save()
+    # Mettre a jour le timestamp
+    session = sm._get_session()
+    session["last_activity"] = datetime.now().isoformat()
+    sm._set_session(session)
 
     # Silencieux - pas de message
 
@@ -223,19 +183,25 @@ def main():
         hook_input = {}
 
     cwd = hook_input.get('cwd', '.')
+    cwd = os.path.normpath(cwd)
+    session_id = hook_input.get('session_id', '')
     event = hook_input.get('hook_event_name', 'unknown')
     source = hook_input.get('source', '')
+
+    if not session_id:
+        # Pas de session_id = on ne peut rien faire
+        return
 
     if event == "SessionStart":
         if source in ("resume", "clear", "compact"):
             return
-        start_session(cwd)
+        start_session(cwd, session_id)
 
     elif event == "SessionEnd":
-        stop_session()
+        stop_session(cwd, session_id)
 
     elif event == "UserPromptSubmit":
-        update_activity()
+        update_activity(cwd, session_id)
 
 
 if __name__ == "__main__":

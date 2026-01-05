@@ -17,7 +17,7 @@ import subprocess
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 DATA_DIR = SCRIPT_DIR / "data"
-SESSION_FILE = DATA_DIR / "session.json"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
 LOCAL_LOG_FILE = DATA_DIR / "local_log.json"
 PENDING_FILE = DATA_DIR / "pending_push.json"
 FOLDER_MAPPINGS_FILE = DATA_DIR / "folder_mappings.json"
@@ -109,41 +109,73 @@ class KimaiClient:
 # =============================================================================
 
 class SessionManager:
-    """Gestion de la session en cours"""
+    """Gestion des sessions multiples (par session_id Claude Code)"""
 
-    def __init__(self):
+    def __init__(self, folder: str = None, session_id: str = None):
+        """
+        Args:
+            folder: Dossier de travail (défaut: cwd)
+            session_id: ID de session Claude Code (passé par le hook)
+        """
         DATA_DIR.mkdir(exist_ok=True)
-        self.session = self._load()
+        self.folder = os.path.normpath(folder) if folder else os.path.normpath(os.getcwd())
+        self.session_id = session_id
+        self.sessions = self._load_all()
 
-    def _load(self) -> Optional[dict]:
-        """Charge la session en cours"""
-        if SESSION_FILE.exists():
-            with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+    def _load_all(self) -> dict:
+        """Charge toutes les sessions"""
+        if SESSIONS_FILE.exists():
+            with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        return None
+        return {}
 
-    def _save(self):
-        """Sauvegarde la session"""
-        if self.session:
-            with open(SESSION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.session, f, indent=2, default=str)
-        elif SESSION_FILE.exists():
-            SESSION_FILE.unlink()
+    def _save_all(self):
+        """Sauvegarde toutes les sessions"""
+        with open(SESSIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.sessions, f, indent=2, default=str)
+
+    def _get_session(self) -> Optional[dict]:
+        """Récupère la session courante (par session_id)"""
+        if not self.session_id:
+            return None
+        return self.sessions.get(self.session_id)
+
+    def _set_session(self, session_data: Optional[dict]):
+        """Définit la session courante"""
+        if not self.session_id:
+            return
+        if session_data is None:
+            self.sessions.pop(self.session_id, None)
+        else:
+            self.sessions[self.session_id] = session_data
+        self._save_all()
 
     def is_active(self) -> bool:
-        """Vérifie si une session est active"""
-        return self.session is not None
+        """Vérifie si une session est active pour ce session_id"""
+        return self._get_session() is not None
 
-    def start(self, folder: str, folder_type: str, project_id: int = None,
+    def has_any_session(self) -> bool:
+        """Vérifie si au moins une session existe"""
+        return len(self.sessions) > 0
+
+    def get_folder_sessions(self) -> dict:
+        """Récupère toutes les sessions du folder courant"""
+        return {sid: s for sid, s in self.sessions.items() if s.get("folder") == self.folder}
+
+    def get_all_sessions(self) -> dict:
+        """Récupère toutes les sessions actives"""
+        return self.sessions
+
+    def start(self, folder_type: str, project_id: int = None,
               project_name: str = None) -> dict:
         """Démarre une nouvelle session"""
         if self.is_active():
-            raise RuntimeError("Une session est déjà active. Utilisez 'stop' ou 'cancel'.")
+            raise RuntimeError(f"Session déjà active pour ce folder+process.")
 
         now = datetime.now()
-        self.session = {
+        session = {
             "begin": now.isoformat(),
-            "folder": folder,
+            "folder": self.folder,
             "folder_type": folder_type,
             "project_id": project_id,
             "project_name": project_name,
@@ -151,42 +183,40 @@ class SessionManager:
             "activity_log": [],
             "activity_breakdown": {}
         }
-        self._save()
-        return self.session
+        self._set_session(session)
+        return session
 
     def update_activity(self, files: list = None, estimate: str = None):
         """Met à jour le timestamp et l'estimation d'activité"""
-        if not self.is_active():
+        session = self._get_session()
+        if not session:
             return
 
         now = datetime.now()
-        self.session["last_activity"] = now.isoformat()
+        session["last_activity"] = now.isoformat()
 
         if estimate:
-            # Ajouter au log
-            self.session["activity_log"].append({
+            session["activity_log"].append({
                 "time": now.strftime("%H:%M"),
                 "files": files or [],
                 "estimate": estimate
             })
-            # Mettre à jour le breakdown (en minutes depuis le dernier update)
-            if estimate not in self.session["activity_breakdown"]:
-                self.session["activity_breakdown"][estimate] = 0
-            # On ajoute 1 minute à chaque update (approximation)
-            self.session["activity_breakdown"][estimate] += 1
-            self.session["current_activity_estimate"] = estimate
+            if estimate not in session["activity_breakdown"]:
+                session["activity_breakdown"][estimate] = 0
+            session["activity_breakdown"][estimate] += 1
+            session["current_activity_estimate"] = estimate
 
-        self._save()
+        self._set_session(session)
 
     def stop(self) -> dict:
         """Arrête la session et retourne les données"""
-        if not self.is_active():
-            raise RuntimeError("Aucune session active.")
+        session = self._get_session()
+        if not session:
+            raise RuntimeError("Aucune session active pour ce folder+process.")
 
-        session_data = self.session.copy()
+        session_data = session.copy()
         session_data["end"] = datetime.now().isoformat()
 
-        # Calculer les durées
         begin = datetime.fromisoformat(session_data["begin"])
         end = datetime.fromisoformat(session_data["end"])
         last_activity = datetime.fromisoformat(session_data["last_activity"])
@@ -194,32 +224,96 @@ class SessionManager:
         session_data["billed_minutes"] = int((end - begin).total_seconds() / 60)
         session_data["real_minutes"] = int((last_activity - begin).total_seconds() / 60)
 
-        self.session = None
-        self._save()
+        self._set_session(None)
         return session_data
 
     def cancel(self):
         """Annule la session sans logger"""
-        self.session = None
-        self._save()
+        self._set_session(None)
 
     def status(self) -> dict:
-        """Retourne le statut de la session"""
-        if not self.is_active():
+        """Retourne le statut de la session courante"""
+        session = self._get_session()
+        if not session:
             return {"active": False}
 
-        begin = datetime.fromisoformat(self.session["begin"])
+        begin = datetime.fromisoformat(session["begin"])
         now = datetime.now()
         elapsed = int((now - begin).total_seconds() / 60)
 
         return {
             "active": True,
-            "project_name": self.session.get("project_name", "Unknown"),
-            "folder_type": self.session.get("folder_type"),
+            "folder": session.get("folder", self.folder),
+            "session_id": self.session_id,
+            "project_name": session.get("project_name", "Unknown"),
+            "folder_type": session.get("folder_type"),
             "elapsed_minutes": elapsed,
-            "current_activity": self.session.get("current_activity_estimate", "unknown"),
-            "breakdown": self.session.get("activity_breakdown", {})
+            "current_activity": session.get("current_activity_estimate", "unknown"),
+            "breakdown": session.get("activity_breakdown", {})
         }
+
+    def status_all(self) -> list:
+        """Retourne le statut de toutes les sessions actives"""
+        result = []
+        now = datetime.now()
+        for session_id, session in self.sessions.items():
+            begin = datetime.fromisoformat(session["begin"])
+            elapsed = int((now - begin).total_seconds() / 60)
+            result.append({
+                "active": True,
+                "folder": session.get("folder"),
+                "session_id": session_id,
+                "project_name": session.get("project_name", "Unknown"),
+                "folder_type": session.get("folder_type"),
+                "elapsed_minutes": elapsed,
+                "current_activity": session.get("current_activity_estimate", "unknown"),
+            })
+        return result
+
+    def cleanup_old_sessions(self, logger=None, config: dict = None, max_hours: int = 12) -> list:
+        """
+        Ferme proprement les sessions trop anciennes (orphelines probables).
+        Critères: > max_hours depuis le début OU jour différent.
+        Les sessions sont loggées avec last_activity comme heure de fin.
+        """
+        closed = []
+        now = datetime.now()
+
+        for session_id in list(self.sessions.keys()):
+            session = self.sessions[session_id]
+            begin = datetime.fromisoformat(session["begin"])
+
+            # Orpheline si: autre jour OU > max_hours
+            is_old = (begin.date() != now.date()) or ((now - begin).total_seconds() > max_hours * 3600)
+
+            if is_old:
+                self.sessions.pop(session_id)
+                last_activity = datetime.fromisoformat(session["last_activity"])
+
+                session_data = session.copy()
+                session_data["end"] = last_activity.isoformat()
+                session_data["billed_minutes"] = int((last_activity - begin).total_seconds() / 60)
+                session_data["real_minutes"] = session_data["billed_minutes"]
+
+                activity = session.get("current_activity_estimate")
+                if not activity and config:
+                    activity = config.get("default_activity", "dev_applicatif")
+                session_data["activity"] = activity or "dev_applicatif"
+
+                if logger:
+                    logger.add_entry(session_data, pushed_to_kimai=False)
+
+                closed.append({
+                    "folder": session.get("folder"),
+                    "session_id": session_id,
+                    "project_name": session.get("project_name"),
+                    "begin": session.get("begin"),
+                    "billed_minutes": session_data["billed_minutes"]
+                })
+
+        if closed:
+            self._save_all()
+        return closed
 
 
 # =============================================================================
@@ -403,39 +497,59 @@ def set_folder_mapping(folder: str, folder_type: str, project_id: int = None,
 # =============================================================================
 
 def cmd_status(args):
-    """Affiche le statut de la session"""
-    sm = SessionManager()
-    status = sm.status()
+    """Affiche le statut des sessions"""
+    folder = args.folder if hasattr(args, 'folder') and args.folder else None
+    sm = SessionManager(folder=folder)
 
-    if not status["active"]:
-        print("Aucune session active")
+    if args.all if hasattr(args, 'all') else False:
+        # Afficher toutes les sessions
+        all_sessions = sm.status_all()
+        if not all_sessions:
+            print("Aucune session active")
+            return
+
+        print(f"Sessions actives: {len(all_sessions)}")
+        print("-" * 75)
+        for s in all_sessions:
+            hours, mins = divmod(s["elapsed_minutes"], 60)
+            folder_short = Path(s["folder"]).name
+            sid_short = s["session_id"][:8]
+            print(f"  [{sid_short}] {s['project_name']:<25} | {hours}h{mins:02d} | {folder_short}")
         return
 
-    elapsed = status["elapsed_minutes"]
-    hours, mins = divmod(elapsed, 60)
+    # Session du folder courant (toutes les sessions de ce folder)
+    folder_sessions = sm.get_folder_sessions()
+    if not folder_sessions:
+        # Peut-être des sessions ailleurs ?
+        all_sessions = sm.status_all()
+        if all_sessions:
+            print(f"Aucune session dans ce dossier. {len(all_sessions)} session(s) active(s) ailleurs.")
+            print("Utilisez --all pour voir toutes les sessions.")
+        else:
+            print("Aucune session active")
+        return
 
-    print(f"Session en cours: {status['project_name']}")
-    print(f"Type: {status['folder_type']}")
-    print(f"Durée: {hours}h{mins:02d}")
-    print(f"Activité estimée: {status['current_activity']}")
-
-    if status["breakdown"]:
-        print("Breakdown:")
-        for act, mins in status["breakdown"].items():
-            print(f"  - {act}: {mins}min")
+    print(f"Sessions dans {Path(sm.folder).name}:")
+    print("-" * 65)
+    for session_id, session in folder_sessions.items():
+        begin = datetime.fromisoformat(session["begin"])
+        elapsed = int((datetime.now() - begin).total_seconds() / 60)
+        hours, mins = divmod(elapsed, 60)
+        activity = session.get("current_activity_estimate", "unknown")
+        sid_short = session_id[:8]
+        print(f"  [{sid_short}] {session.get('project_name', 'Unknown'):<25} | {hours}h{mins:02d} | {activity}")
 
 
 def cmd_start(args):
     """Démarre une session"""
     config = load_config()
-    sm = SessionManager()
-
-    if sm.is_active():
-        print("Session déjà active. Utilisez 'stop' ou 'cancel' d'abord.")
-        return
-
     folder = args.folder or os.getcwd()
     folder = os.path.normpath(folder)
+    sm = SessionManager(folder=folder)
+
+    if sm.is_active():
+        print("Session déjà active pour ce process. Utilisez 'stop' ou 'cancel' d'abord.")
+        return
 
     # Chercher le mapping
     mapping = get_folder_mapping(folder)
@@ -480,7 +594,7 @@ def cmd_start(args):
         project_id = args.project
         project_name = folder_name
 
-    session = sm.start(folder, folder_type, project_id, project_name)
+    session = sm.start(folder_type, project_id, project_name)
     print(f"Session démarrée: {project_name}")
     print(f"Début: {session['begin']}")
 
@@ -488,17 +602,18 @@ def cmd_start(args):
 def cmd_stop(args):
     """Arrête la session"""
     config = load_config()
-    sm = SessionManager()
+    folder = args.folder if hasattr(args, 'folder') and args.folder else None
+    sm = SessionManager(folder=folder)
     logger = LocalLogger()
 
     if not sm.is_active():
-        print("Aucune session active")
+        print("Aucune session active pour ce process")
         return
 
     session_data = sm.stop()
 
     # Déterminer l'activité
-    activity = args.activity or config.get("default_activity", "dev_applicatif")
+    activity = args.activity or session_data.get("current_activity_estimate") or config.get("default_activity", "dev_applicatif")
     session_data["activity"] = activity
 
     folder_type = session_data.get("folder_type", "pro")
@@ -546,9 +661,10 @@ def cmd_stop(args):
 
 def cmd_cancel(args):
     """Annule la session"""
-    sm = SessionManager()
+    folder = args.folder if hasattr(args, 'folder') and args.folder else None
+    sm = SessionManager(folder=folder)
     if not sm.is_active():
-        print("Aucune session active")
+        print("Aucune session active pour ce process")
         return
 
     sm.cancel()
@@ -939,7 +1055,8 @@ def cmd_push(args):
 
 def cmd_describe(args):
     """Ajoute une description à la session en cours ou à une entrée"""
-    sm = SessionManager()
+    folder = args.folder if hasattr(args, 'folder') and args.folder else None
+    sm = SessionManager(folder=folder)
     logger = LocalLogger()
 
     if args.index is not None:
@@ -956,7 +1073,7 @@ def cmd_describe(args):
         if not args.text:
             current = entry.get("description", "(aucune)")
             print(f"Description actuelle: {current}")
-            print("Usage: kimay describe <index> \"texte de description\"")
+            print("Usage: nectime describe <index> \"texte de description\"")
             return
 
         logger.log["entries"][real_idx]["description"] = args.text
@@ -965,18 +1082,19 @@ def cmd_describe(args):
 
     elif sm.is_active():
         # Ajouter à la session en cours
+        session = sm._get_session()
         if not args.text:
-            current = sm.session.get("description", "(aucune)")
+            current = session.get("description", "(aucune)")
             print(f"Description actuelle: {current}")
-            print("Usage: kimay describe \"texte de description\"")
+            print("Usage: nectime describe \"texte de description\"")
             return
 
-        sm.session["description"] = args.text
-        sm._save()
+        session["description"] = args.text
+        sm._set_session(session)
         print(f"Description ajoutée à la session en cours")
 
     else:
-        print("Aucune session active. Utilisez: kimay describe <index> \"texte\"")
+        print("Aucune session active. Utilisez: nectime describe <index> \"texte\"")
 
 
 def cmd_edit(args):
@@ -1042,11 +1160,14 @@ def cmd_edit(args):
 def cmd_activity(args):
     """Change ou affiche l'activité en cours"""
     config = load_config()
-    sm = SessionManager()
+    folder = args.folder if hasattr(args, 'folder') and args.folder else None
+    sm = SessionManager(folder=folder)
 
     if not sm.is_active():
-        print("Aucune session active")
+        print("Aucune session active pour ce process")
         return
+
+    session = sm._get_session()
 
     if args.activity_key:
         # Vérifier que l'activité existe
@@ -1064,8 +1185,8 @@ def cmd_activity(args):
         print(f"  -> {activity_mappings[args.activity_key].get('name')}")
     else:
         # Afficher l'activité actuelle
-        current = sm.session.get("current_activity_estimate", "non définie")
-        breakdown = sm.session.get("activity_breakdown", {})
+        current = session.get("current_activity_estimate", "non définie")
+        breakdown = session.get("activity_breakdown", {})
 
         print(f"Activité actuelle: {current}")
         if breakdown:
@@ -1076,13 +1197,13 @@ def cmd_activity(args):
 
 def cmd_set(args):
     """Configure le type de projet pour un dossier"""
-    sm = SessionManager()
     config = load_config()
 
     folder_type = args.type
     project_id = args.project_id
     folder = args.folder or os.getcwd()
     folder = os.path.normpath(folder)
+    sm = SessionManager(folder=folder)
 
     # Récupérer le nom du projet si pro
     project_name = None
@@ -1110,12 +1231,13 @@ def cmd_set(args):
     # Sauvegarder le mapping
     set_folder_mapping(folder, folder_type, project_id, project_name)
 
-    # Mettre à jour la session en cours si elle existe et correspond au dossier
-    if sm.is_active() and sm.session.get("folder") == folder:
-        sm.session["folder_type"] = folder_type
-        sm.session["project_id"] = project_id
-        sm.session["project_name"] = project_name
-        sm._save()
+    # Mettre à jour la session en cours si elle existe
+    session = sm._get_session()
+    if session:
+        session["folder_type"] = folder_type
+        session["project_id"] = project_id
+        session["project_name"] = project_name
+        sm._set_session(session)
         print(f"Session mise à jour: {project_name} ({folder_type})")
     else:
         print(f"Mapping enregistré: {folder}")
@@ -1133,6 +1255,25 @@ def cmd_set(args):
         print(f"  -> Ce dossier sera ignoré")
 
 
+def cmd_cleanup(args):
+    """Ferme les sessions anciennes (> 12h ou jour different)"""
+    config = load_config()
+    sm = SessionManager()
+    logger = LocalLogger()
+
+    closed = sm.cleanup_old_sessions(logger=logger, config=config)
+
+    if not closed:
+        print("Aucune session ancienne a fermer")
+        return
+
+    print(f"Sessions fermees et loggees: {len(closed)}")
+    for s in closed:
+        h, m = divmod(s.get('billed_minutes', 0), 60)
+        sid_short = s.get('session_id', '?')[:8]
+        print(f"  - {s['project_name']} ({h}h{m:02d}) [{sid_short}]")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1142,7 +1283,9 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Commandes")
 
     # status
-    sp = subparsers.add_parser("status", help="Statut de la session")
+    sp = subparsers.add_parser("status", help="Statut des sessions")
+    sp.add_argument("--all", "-a", action="store_true", help="Afficher toutes les sessions")
+    sp.add_argument("--folder", "-f", help="Dossier (défaut: cwd)")
     sp.set_defaults(func=cmd_status)
 
     # start
@@ -1154,13 +1297,19 @@ def main():
 
     # stop
     sp = subparsers.add_parser("stop", help="Arrêter la session")
+    sp.add_argument("--folder", "-f", help="Dossier (défaut: cwd)")
     sp.add_argument("--activity", "-a", help="Clé d'activité (ex: dev_embarque)")
     sp.add_argument("--dry-run", action="store_true", help="Ne pas poster sur Kimai")
     sp.set_defaults(func=cmd_stop)
 
     # cancel
     sp = subparsers.add_parser("cancel", help="Annuler la session")
+    sp.add_argument("--folder", "-f", help="Dossier (défaut: cwd)")
     sp.set_defaults(func=cmd_cancel)
+
+    # cleanup
+    sp = subparsers.add_parser("cleanup", help="Nettoyer les sessions orphelines")
+    sp.set_defaults(func=cmd_cleanup)
 
     # projects
     sp = subparsers.add_parser("projects", help="Lister les projets Kimai")
@@ -1185,6 +1334,7 @@ def main():
     # activity
     sp = subparsers.add_parser("activity", help="Changer ou afficher l'activité en cours")
     sp.add_argument("activity_key", nargs="?", help="Clé d'activité (ex: dev_embarque)")
+    sp.add_argument("--folder", "-f", help="Dossier (défaut: cwd)")
     sp.set_defaults(func=cmd_activity)
 
     # push
