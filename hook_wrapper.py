@@ -161,19 +161,104 @@ def stop_session(cwd: str, session_id: str):
     output_message(msg)
 
 
-def update_activity(cwd: str, session_id: str):
+def estimate_activity(prompt: str, cwd: str, config: dict) -> str:
+    """Estime l'activite basee sur le prompt et les fichiers recents"""
+    auto_config = config.get("auto_activity", {})
+    rules = auto_config.get("rules", {})
+
+    prompt_lower = prompt.lower()
+    scores = {}
+
+    for activity, rule in rules.items():
+        score = 0
+
+        # Verifier les mots-cles dans le prompt
+        for keyword in rule.get("keywords", []):
+            if keyword.lower() in prompt_lower:
+                score += 2
+
+        # Verifier les extensions mentionnees dans le prompt
+        for ext in rule.get("extensions", []):
+            if ext in prompt_lower:
+                score += 3
+
+        if score > 0:
+            scores[activity] = score
+
+    # Regarder les fichiers recemment modifies (< 5 min) dans cwd
+    try:
+        import glob
+        import time
+        now = time.time()
+        for filepath in glob.glob(os.path.join(cwd, "**/*"), recursive=True):
+            if os.path.isfile(filepath):
+                try:
+                    mtime = os.path.getmtime(filepath)
+                    if now - mtime < 300:  # 5 minutes
+                        ext = os.path.splitext(filepath)[1].lower()
+                        for activity, rule in rules.items():
+                            if ext in rule.get("extensions", []):
+                                scores[activity] = scores.get(activity, 0) + 1
+                except:
+                    pass
+    except:
+        pass
+
+    if scores:
+        return max(scores, key=scores.get)
+    return None
+
+
+def update_activity(cwd: str, session_id: str, prompt: str = ""):
     """Met a jour last_activity (appele a chaque message)"""
+    config = load_config()
     sm = SessionManager(folder=cwd, session_id=session_id)
 
     if not sm.is_active():
         return
 
-    # Mettre a jour le timestamp
     session = sm._get_session()
-    session["last_activity"] = datetime.now().isoformat()
+    now = datetime.now()
+    session["last_activity"] = now.isoformat()
+
+    # Auto-estimation de l'activite
+    auto_config = config.get("auto_activity", {})
+    if auto_config.get("enabled", False):
+        interval = auto_config.get("interval_minutes", 15)
+        last_estimate = session.get("last_activity_estimate_time")
+
+        should_estimate = False
+        if not last_estimate:
+            should_estimate = True
+        else:
+            last_dt = datetime.fromisoformat(last_estimate)
+            if (now - last_dt).total_seconds() >= interval * 60:
+                should_estimate = True
+
+        if should_estimate and prompt:
+            estimated = estimate_activity(prompt, cwd, config)
+            if estimated:
+                current = session.get("current_activity_estimate")
+
+                if estimated != current:
+                    ask = auto_config.get("ask_before_change", False)
+
+                    if ask and current:
+                        # Demander confirmation via systemMessage
+                        msg = f"NECTIME: Activite detectee: {estimated} (actuelle: {current or 'aucune'}). Changer? /nectime activity {estimated}"
+                        output_message(msg)
+                    else:
+                        # Changer directement
+                        session["current_activity_estimate"] = estimated
+                        if current:
+                            msg = f"NECTIME: Activite changee: {current} -> {estimated}"
+                            output_message(msg)
+
+                session["last_activity_estimate_time"] = now.isoformat()
+
     sm._set_session(session)
 
-    # Silencieux - pas de message
+    # Silencieux si pas de changement
 
 
 def main():
@@ -201,7 +286,8 @@ def main():
         stop_session(cwd, session_id)
 
     elif event == "UserPromptSubmit":
-        update_activity(cwd, session_id)
+        prompt = hook_input.get('prompt', '')
+        update_activity(cwd, session_id, prompt)
 
 
 if __name__ == "__main__":

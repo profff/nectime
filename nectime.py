@@ -509,12 +509,13 @@ def cmd_status(args):
             return
 
         print(f"Sessions actives: {len(all_sessions)}")
-        print("-" * 75)
+        print("-" * 85)
         for s in all_sessions:
             hours, mins = divmod(s["elapsed_minutes"], 60)
             folder_short = Path(s["folder"]).name
             sid_short = s["session_id"][:8]
-            print(f"  [{sid_short}] {s['project_name']:<25} | {hours}h{mins:02d} | {folder_short}")
+            activity = s.get("current_activity", "?")[:12]
+            print(f"  [{sid_short}] {s['project_name']:<25} | {hours}h{mins:02d} | {activity:<12} | {folder_short}")
         return
 
     # Session du folder courant (toutes les sessions de ce folder)
@@ -530,12 +531,12 @@ def cmd_status(args):
         return
 
     print(f"Sessions dans {Path(sm.folder).name}:")
-    print("-" * 65)
+    print("-" * 70)
     for session_id, session in folder_sessions.items():
         begin = datetime.fromisoformat(session["begin"])
         elapsed = int((datetime.now() - begin).total_seconds() / 60)
         hours, mins = divmod(elapsed, 60)
-        activity = session.get("current_activity_estimate", "unknown")
+        activity = session.get("current_activity_estimate", "?")[:12]
         sid_short = session_id[:8]
         print(f"  [{sid_short}] {session.get('project_name', 'Unknown'):<25} | {hours}h{mins:02d} | {activity}")
 
