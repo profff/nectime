@@ -389,33 +389,144 @@ class LocalLogger:
         entries = self.get_entries(date)
         return sum(e.get("billed_minutes", 0) for e in entries if e.get("pushed_to_kimai"))
 
-    def calculate_shrink_ratio(self, new_minutes: int, daily_limit: int = 480) -> float:
+    def calculate_adjustment_ratio(self, new_minutes: int, daily_limit: int = 480,
+                                      date: str = None, expand: bool = True) -> float:
         """
-        Calcule le ratio de shrink pour respecter la limite journalière.
+        Calcule le ratio d'ajustement pour atteindre la limite journalière.
+
+        - Si total > limit : shrink (ratio < 1)
+        - Si total < limit et expand=True : expand (ratio > 1)
+        - Sinon : ratio = 1.0
 
         Args:
             new_minutes: Minutes à ajouter
             daily_limit: Limite en minutes (défaut: 480 = 8h)
+            date: Date concernée (défaut: aujourd'hui)
+            expand: Autoriser l'expansion si < limit
 
         Returns:
-            Ratio à appliquer (1.0 si pas de shrink nécessaire)
+            Ratio à appliquer
         """
-        date = datetime.now().strftime("%Y-%m-%d")
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+
         already_pushed = self.get_kimai_pushed_minutes(date)
-
-        total_if_pushed = already_pushed + new_minutes
-
-        if total_if_pushed <= daily_limit:
-            return 1.0
-
-        # Calculer le ratio pour que le total = limit
-        # On ne peut shrink que ce qu'on ajoute, pas ce qui est déjà pushé
-        remaining_capacity = max(0, daily_limit - already_pushed)
 
         if new_minutes <= 0:
             return 1.0
 
-        return remaining_capacity / new_minutes
+        total_if_pushed = already_pushed + new_minutes
+        remaining_capacity = max(0, daily_limit - already_pushed)
+
+        if total_if_pushed > daily_limit:
+            # Shrink: trop d'heures
+            return remaining_capacity / new_minutes
+        elif expand and total_if_pushed < daily_limit and remaining_capacity > 0:
+            # Expand: pas assez d'heures, grossir pour atteindre la limite
+            return remaining_capacity / new_minutes
+        else:
+            return 1.0
+
+    # Alias pour rétrocompatibilité
+    def calculate_shrink_ratio(self, new_minutes: int, daily_limit: int = 480) -> float:
+        """Alias vers calculate_adjustment_ratio (shrink only)"""
+        return self.calculate_adjustment_ratio(new_minutes, daily_limit, expand=False)
+
+    def fill_empty_weekdays(self, start_date: str, end_date: str) -> list:
+        """
+        Remplit les jours de semaine vides en copiant les entrées du dernier jour non-vide.
+
+        Args:
+            start_date: Date de début (YYYY-MM-DD)
+            end_date: Date de fin (YYYY-MM-DD)
+
+        Returns:
+            Liste des entrées créées
+        """
+        # Récupérer toutes les entrées non-pushées de type "pro"
+        all_entries = [e for e in self.log["entries"]
+                       if not e.get("pushed_to_kimai")
+                       and e.get("folder_type") == "pro"
+                       and e.get("project_id")]
+
+        # Grouper par date
+        entries_by_date = {}
+        for e in all_entries:
+            d = e.get("date", e.get("begin", "")[:10])
+            if d not in entries_by_date:
+                entries_by_date[d] = []
+            entries_by_date[d].append(e)
+
+        # Trouver les jours de semaine dans la plage
+        weekdays = get_weekdays_in_range(start_date, end_date)
+
+        # Identifier les jours vides
+        empty_days = [d for d in weekdays if d not in entries_by_date]
+
+        if not empty_days:
+            return []
+
+        # Trouver le dernier jour non-vide (avant ou dans la plage)
+        all_dates_with_entries = sorted(entries_by_date.keys())
+        if not all_dates_with_entries:
+            return []
+
+        # Chercher le jour source le plus récent avant le premier jour vide
+        source_date = None
+        for d in reversed(all_dates_with_entries):
+            if d <= empty_days[0]:
+                source_date = d
+                break
+
+        # Si pas trouvé avant, prendre le premier disponible
+        if not source_date:
+            source_date = all_dates_with_entries[0]
+
+        source_entries = entries_by_date[source_date]
+        created = []
+
+        for empty_day in empty_days:
+            # Copier les entrées du jour source
+            for src in source_entries:
+                # Calculer les nouvelles heures (garder la durée, changer la date)
+                src_begin = datetime.fromisoformat(src["begin"])
+                src_end = datetime.fromisoformat(src["end"])
+                duration = src_end - src_begin
+
+                # Nouvelles heures: même heure de début, même durée
+                new_begin = datetime.strptime(empty_day, "%Y-%m-%d").replace(
+                    hour=src_begin.hour, minute=src_begin.minute
+                )
+                new_end = new_begin + duration
+
+                new_entry = {
+                    "date": empty_day,
+                    "folder": src.get("folder"),
+                    "folder_type": src.get("folder_type"),
+                    "project_id": src.get("project_id"),
+                    "project_name": src.get("project_name"),
+                    "activity": src.get("activity"),
+                    "begin": new_begin.isoformat(),
+                    "end": new_end.isoformat(),
+                    "billed_minutes": src.get("billed_minutes", 0),
+                    "real_minutes": src.get("real_minutes", 0),
+                    "pushed_to_kimai": False,
+                    "filled_from": source_date
+                }
+
+                self.log["entries"].append(new_entry)
+                created.append(new_entry)
+
+                # Mettre à jour les totaux journaliers
+                if empty_day not in self.log["daily_totals"]:
+                    self.log["daily_totals"][empty_day] = {"billed": 0, "real": 0}
+                self.log["daily_totals"][empty_day]["billed"] += new_entry["billed_minutes"]
+                self.log["daily_totals"][empty_day]["real"] += new_entry["real_minutes"]
+
+        if created:
+            self._save()
+
+        return created
 
 
 # =============================================================================
@@ -477,15 +588,19 @@ def get_folder_mapping(folder: str) -> Optional[dict]:
 
 
 def set_folder_mapping(folder: str, folder_type: str, project_id: int = None,
-                       project_name: str = None):
+                       project_name: str = None, custom_activity: str = None):
     """Ajoute ou met à jour un mapping dossier → projet"""
     folder = os.path.normpath(folder)
     mappings = load_folder_mappings()
 
+    # Récupérer l'ancien mapping pour conserver custom_activity si pas redéfinie
+    old_mapping = mappings.get(folder, {})
+
     mappings[folder] = {
         "folder_type": folder_type,
         "project_id": project_id,
-        "project_name": project_name
+        "project_name": project_name,
+        "custom_activity": custom_activity if custom_activity is not None else old_mapping.get("custom_activity")
     }
 
     save_folder_mappings(mappings)
@@ -501,6 +616,15 @@ def cmd_status(args):
     folder = args.folder if hasattr(args, 'folder') and args.folder else None
     sm = SessionManager(folder=folder)
 
+    # Labels pour les types de projet
+    type_labels = {
+        "pro": "PRO",
+        "perso": "LOCAL",
+        "pending": "PENDING",
+        "off": "OFF",
+        None: "N/A"
+    }
+
     if args.all if hasattr(args, 'all') else False:
         # Afficher toutes les sessions
         all_sessions = sm.status_all()
@@ -509,36 +633,52 @@ def cmd_status(args):
             return
 
         print(f"Sessions actives: {len(all_sessions)}")
-        print("-" * 85)
+        print("-" * 100)
         for s in all_sessions:
             hours, mins = divmod(s["elapsed_minutes"], 60)
-            folder_short = Path(s["folder"]).name
             sid_short = s["session_id"][:8]
             activity = s.get("current_activity", "?")[:12]
-            print(f"  [{sid_short}] {s['project_name']:<25} | {hours}h{mins:02d} | {activity:<12} | {folder_short}")
+            ftype = type_labels.get(s.get("folder_type"), "N/A")
+            folder_path = s.get("folder", "?")
+            print(f"  [{sid_short}] {s['project_name']:<22} | {ftype:<7} | {hours}h{mins:02d} | {activity:<12}")
+            print(f"             {folder_path}")
         return
 
     # Session du folder courant (toutes les sessions de ce folder)
     folder_sessions = sm.get_folder_sessions()
+
+    # Récupérer le mapping du dossier pour afficher le type même sans session
+    mapping = get_folder_mapping(sm.folder)
+    folder_type = mapping.get("folder_type") if mapping else None
+    ftype_label = type_labels.get(folder_type, "N/A")
+
     if not folder_sessions:
+        # Afficher quand même les infos du dossier
+        print(f"Dossier: {Path(sm.folder).name}")
+        print(f"Type: {ftype_label}")
+        if mapping:
+            print(f"Projet: {mapping.get('project_name', 'N/A')}")
+            custom_act = mapping.get("custom_activity")
+            if custom_act:
+                print(f"Activité custom: {custom_act}")
+        print(f"Session: inactive")
+
         # Peut-être des sessions ailleurs ?
         all_sessions = sm.status_all()
         if all_sessions:
-            print(f"Aucune session dans ce dossier. {len(all_sessions)} session(s) active(s) ailleurs.")
-            print("Utilisez --all pour voir toutes les sessions.")
-        else:
-            print("Aucune session active")
+            print(f"\n{len(all_sessions)} session(s) active(s) ailleurs. Utilisez --all")
         return
 
-    print(f"Sessions dans {Path(sm.folder).name}:")
-    print("-" * 70)
+    print(f"Sessions dans {Path(sm.folder).name} [{ftype_label}]:")
+    print("-" * 80)
     for session_id, session in folder_sessions.items():
         begin = datetime.fromisoformat(session["begin"])
         elapsed = int((datetime.now() - begin).total_seconds() / 60)
         hours, mins = divmod(elapsed, 60)
         activity = session.get("current_activity_estimate", "?")[:12]
         sid_short = session_id[:8]
-        print(f"  [{sid_short}] {session.get('project_name', 'Unknown'):<25} | {hours}h{mins:02d} | {activity}")
+        ftype = type_labels.get(session.get("folder_type"), "N/A")
+        print(f"  [{sid_short}] {session.get('project_name', 'Unknown'):<22} | {ftype:<7} | {hours}h{mins:02d} | {activity}")
 
 
 def cmd_start(args):
@@ -727,6 +867,25 @@ def cmd_log(args):
     print(f"Total facturé: {bh}h{bm:02d} | Réel: {rh}h{rm:02d}")
 
 
+def is_weekday(date_str: str) -> bool:
+    """Vérifie si une date est un jour de semaine (lun-ven)"""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return dt.weekday() < 5  # 0=lundi, 4=vendredi
+
+
+def get_weekdays_in_range(start_date: str, end_date: str) -> list:
+    """Retourne tous les jours de semaine entre deux dates"""
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    weekdays = []
+    current = start
+    while current <= end:
+        if current.weekday() < 5:
+            weekdays.append(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+    return weekdays
+
+
 def get_git_commits(folder: str, since: str, until: str) -> list:
     """Récupère les commits git entre deux dates"""
     try:
@@ -744,9 +903,10 @@ def get_git_commits(folder: str, since: str, until: str) -> list:
         return []
 
 
-def consolidate_entries(entries: list, shrink_ratios: dict) -> list:
+def consolidate_entries(entries: list, adjustment_ratios: dict) -> list:
     """
     Consolide les entrées par jour + projet + activité.
+    Applique les ratios d'ajustement (shrink ou expand).
     Retourne une liste de groupes consolidés pour Kimai.
     """
     # Grouper par: date + project_id + activity
@@ -786,16 +946,16 @@ def consolidate_entries(entries: list, shrink_ratios: dict) -> list:
         if e.get("end") > groups[key]["last_end"]:
             groups[key]["last_end"] = e.get("end")
 
-    # Appliquer shrink et calculer les heures pour Kimai
+    # Appliquer ajustement (shrink ou expand) et calculer les heures pour Kimai
     consolidated = []
     for key, group in groups.items():
         date = group["date"]
-        ratio = shrink_ratios.get(date, 1.0)
-        shrunk_minutes = int(group["total_minutes"] * ratio)
+        ratio = adjustment_ratios.get(date, 1.0)
+        adjusted_minutes = int(group["total_minutes"] * ratio)
 
-        # Pour Kimai: utiliser first_begin et calculer end à partir de la durée shrinkée
+        # Pour Kimai: utiliser first_begin et calculer end à partir de la durée ajustée
         begin = datetime.fromisoformat(group["first_begin"])
-        end = begin + timedelta(minutes=shrunk_minutes)
+        end = begin + timedelta(minutes=adjusted_minutes)
 
         # Construire la description pour Kimai
         desc_parts = []
@@ -819,7 +979,7 @@ def consolidate_entries(entries: list, shrink_ratios: dict) -> list:
 
         consolidated.append({
             **group,
-            "shrunk_minutes": shrunk_minutes,
+            "adjusted_minutes": adjusted_minutes,
             "kimai_begin": begin,
             "kimai_end": end,
             "ratio": ratio,
@@ -831,35 +991,42 @@ def consolidate_entries(entries: list, shrink_ratios: dict) -> list:
     return consolidated
 
 
-def display_consolidated(consolidated: list, shrink_ratios: dict, to_push: list, date_label: str, verbose: bool = False):
+def display_consolidated(consolidated: list, adjustment_ratios: dict, to_push: list, date_label: str, verbose: bool = False):
     """Affiche les entrées consolidées"""
     print(f"\nEntrées ({date_label}) - consolidées par jour:")
     print("-" * 75)
 
     total_original = 0
-    total_shrunk = 0
+    total_adjusted = 0
     current_date = None
 
     for group in consolidated:
         date = group["date"]
         if date != current_date:
-            ratio = shrink_ratios.get(date, 1.0)
+            ratio = adjustment_ratios.get(date, 1.0)
             if ratio < 1.0:
-                print(f"\n  [{date}] ⚠ shrink {ratio:.0%}")
+                print(f"\n  [{date}] [-] shrink {ratio:.0%}")
+            elif ratio > 1.0:
+                print(f"\n  [{date}] [+] expand {ratio:.0%}")
             else:
                 print(f"\n  [{date}]")
             current_date = date
 
         original = group["total_minutes"]
-        shrunk = group["shrunk_minutes"]
+        adjusted = group["adjusted_minutes"]
         n_entries = len(group["entries"])
-        h, m = divmod(shrunk, 60)
+        h, m = divmod(adjusted, 60)
 
-        shrink_info = f" -> {h}h{m:02d}" if group["ratio"] < 1.0 else ""
+        if group["ratio"] < 1.0:
+            adjust_info = f" -> {h}h{m:02d}"
+        elif group["ratio"] > 1.0:
+            adjust_info = f" -> {h}h{m:02d}"
+        else:
+            adjust_info = ""
         entries_info = f"({n_entries} sessions)" if n_entries > 1 else ""
 
         h_orig, m_orig = divmod(original, 60)
-        print(f"    {group['project_name']:<22} | {group['activity']:<12} | {h_orig}h{m_orig:02d}{shrink_info} {entries_info}")
+        print(f"    {group['project_name']:<22} | {group['activity']:<12} | {h_orig}h{m_orig:02d}{adjust_info} {entries_info}")
 
         # Afficher description et commits si verbose ou si présents
         if verbose or group.get("kimai_description"):
@@ -873,14 +1040,15 @@ def display_consolidated(consolidated: list, shrink_ratios: dict, to_push: list,
                     print(f"         ... et {n_commits - 1} autres")
 
         total_original += original
-        total_shrunk += shrunk
+        total_adjusted += adjusted
 
     h_orig, m_orig = divmod(total_original, 60)
-    h_shrunk, m_shrunk = divmod(total_shrunk, 60)
+    h_adj, m_adj = divmod(total_adjusted, 60)
     print("-" * 75)
     print(f"Sessions locales: {len(to_push)} -> Timesheets Kimai: {len(consolidated)}")
-    if total_original != total_shrunk:
-        print(f"Total: {h_orig}h{m_orig:02d} -> {h_shrunk}h{m_shrunk:02d} (après shrink)")
+    if total_original != total_adjusted:
+        direction = "shrink" if total_adjusted < total_original else "expand"
+        print(f"Total: {h_orig}h{m_orig:02d} -> {h_adj}h{m_adj:02d} (après {direction})")
     else:
         print(f"Total: {h_orig}h{m_orig:02d}")
 
@@ -896,6 +1064,7 @@ def cmd_summary(args):
 
     config = load_config()
     logger = LocalLogger()
+    sm = SessionManager()
 
     # Toutes les entrées ou filtrées par date
     if args.date:
@@ -911,11 +1080,46 @@ def cmd_summary(args):
                and e.get("folder_type") == "pro"
                and e.get("project_id")]
 
+    # Ajouter les sessions actives PRO
+    active_pro_count = 0
+    now = datetime.now()
+    for sid, session in sm.get_all_sessions().items():
+        if session.get("folder_type") == "pro" and session.get("project_id"):
+            begin = datetime.fromisoformat(session["begin"])
+            date = begin.strftime("%Y-%m-%d")
+
+            # Filtrer par date si spécifiée
+            if args.date and date != args.date:
+                continue
+
+            elapsed = int((now - begin).total_seconds() / 60)
+
+            # Convertir en format entrée
+            active_entry = {
+                "date": date,
+                "folder": session.get("folder"),
+                "folder_type": "pro",
+                "project_id": session.get("project_id"),
+                "project_name": session.get("project_name"),
+                "activity": session.get("current_activity_estimate", config.get("default_activity")),
+                "begin": session.get("begin"),
+                "end": now.isoformat(),
+                "billed_minutes": elapsed,
+                "real_minutes": elapsed,
+                "pushed_to_kimai": False,
+                "is_active": True  # Marqueur pour l'affichage
+            }
+            to_show.append(active_entry)
+            active_pro_count += 1
+
     if not to_show:
         print(f"Aucune entrée à afficher ({date_label})")
         return
 
-    # Calculer shrink ratios
+    if active_pro_count > 0:
+        print(f"(inclut {active_pro_count} session(s) active(s) PRO)")
+
+    # Calculer ratios d'ajustement (shrink ou expand)
     by_date = {}
     for e in to_show:
         d = e.get("date", e.get("begin", "")[:10])
@@ -924,18 +1128,15 @@ def cmd_summary(args):
         by_date[d].append(e)
 
     daily_limit = config.get("daily_limit_hours", 8) * 60
-    shrink_ratios = {}
+    adjustment_ratios = {}
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
-        already_pushed = logger.get_kimai_pushed_minutes(date)
-        available = max(0, daily_limit - already_pushed)
-        if total_minutes > available:
-            shrink_ratios[date] = available / total_minutes if total_minutes > 0 else 1.0
-        else:
-            shrink_ratios[date] = 1.0
+        adjustment_ratios[date] = logger.calculate_adjustment_ratio(
+            total_minutes, daily_limit, date=date, expand=True
+        )
 
-    consolidated = consolidate_entries(to_show, shrink_ratios)
-    display_consolidated(consolidated, shrink_ratios, to_show, date_label, verbose=args.verbose)
+    consolidated = consolidate_entries(to_show, adjustment_ratios)
+    display_consolidated(consolidated, adjustment_ratios, to_show, date_label, verbose=args.verbose)
 
 
 def cmd_push(args):
@@ -949,6 +1150,33 @@ def cmd_push(args):
 
     config = load_config()
     logger = LocalLogger()
+    sm = SessionManager()
+
+    # Remplir les jours vides si demandé
+    fill_empty = getattr(args, 'fill_empty', None)
+    if fill_empty:
+        try:
+            start_date, end_date = fill_empty.split(":")
+            created = logger.fill_empty_weekdays(start_date, end_date)
+            if created:
+                # Grouper par date pour affichage
+                by_day = {}
+                for e in created:
+                    d = e["date"]
+                    if d not in by_day:
+                        by_day[d] = []
+                    by_day[d].append(e)
+                print(f"Jours remplis ({len(by_day)} jours, {len(created)} entrées):")
+                for d in sorted(by_day.keys()):
+                    total_mins = sum(e["billed_minutes"] for e in by_day[d])
+                    h, m = divmod(total_mins, 60)
+                    src = by_day[d][0].get("filled_from", "?")
+                    print(f"  {d}: {h}h{m:02d} (copié de {src})")
+            else:
+                print("Aucun jour vide à remplir dans la plage")
+        except ValueError:
+            print(f"Format invalide pour --fill-empty. Utilisez START:END (ex: 2024-01-01:2024-01-05)")
+            return
 
     # Toutes les entrées ou filtrées par date
     if args.date:
@@ -964,9 +1192,50 @@ def cmd_push(args):
                and e.get("folder_type") == "pro"
                and e.get("project_id")]
 
-    if not to_push:
+    # Ajouter les sessions actives PRO
+    active_sessions_to_close = {}  # sid -> entry data
+    now = datetime.now()
+    for sid, session in sm.get_all_sessions().items():
+        if session.get("folder_type") == "pro" and session.get("project_id"):
+            begin = datetime.fromisoformat(session["begin"])
+            date = begin.strftime("%Y-%m-%d")
+
+            # Filtrer par date si spécifiée
+            if args.date and date != args.date:
+                continue
+
+            elapsed = int((now - begin).total_seconds() / 60)
+
+            # Convertir en format entrée
+            active_entry = {
+                "date": date,
+                "folder": session.get("folder"),
+                "folder_type": "pro",
+                "project_id": session.get("project_id"),
+                "project_name": session.get("project_name"),
+                "activity": session.get("current_activity_estimate", config.get("default_activity")),
+                "begin": session.get("begin"),
+                "end": now.isoformat(),
+                "billed_minutes": elapsed,
+                "real_minutes": elapsed,
+                "pushed_to_kimai": False,
+                "is_active": True,
+                "session_id": sid
+            }
+            to_push.append(active_entry)
+            active_sessions_to_close[sid] = active_entry
+
+    active_pro_count = len(active_sessions_to_close)
+
+    if not to_push and not args.pad and not fill_empty:
         print(f"Aucune entrée à pusher ({date_label})")
         return
+
+    if not to_push:
+        print(f"Aucune entrée à pusher ({date_label}), padding uniquement...")
+
+    if active_pro_count > 0:
+        print(f"(inclut {active_pro_count} session(s) active(s) PRO qui seront fermées)")
 
     # Grouper par date pour le shrink
     by_date = {}
@@ -978,35 +1247,56 @@ def cmd_push(args):
 
     daily_limit = config.get("daily_limit_hours", 8) * 60
 
-    # Calculer les shrink ratios par jour
-    shrink_ratios = {}
+    # Calculer les ratios d'ajustement par jour (shrink ou expand)
+    adjustment_ratios = {}
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
-        already_pushed = logger.get_kimai_pushed_minutes(date)
-        available = max(0, daily_limit - already_pushed)
-
-        if total_minutes > available:
-            shrink_ratios[date] = available / total_minutes if total_minutes > 0 else 1.0
-        else:
-            shrink_ratios[date] = 1.0
+        adjustment_ratios[date] = logger.calculate_adjustment_ratio(
+            total_minutes, daily_limit, date=date, expand=True
+        )
 
     # Consolider les entrées
-    consolidated = consolidate_entries(to_push, shrink_ratios)
+    consolidated = consolidate_entries(to_push, adjustment_ratios)
+
+    # Arrondir à 30 min pour le push Kimai, en respectant le total de 8h/jour
+    # Grouper par date
+    by_date_consolidated = {}
+    for group in consolidated:
+        d = group["date"]
+        if d not in by_date_consolidated:
+            by_date_consolidated[d] = []
+        by_date_consolidated[d].append(group)
+
+    for date, groups in by_date_consolidated.items():
+        # Arrondir chaque entrée à 30 min
+        for group in groups:
+            original = group["adjusted_minutes"]
+            rounded = round(original / 30) * 30
+            if rounded == 0 and original > 0:
+                rounded = 30
+            group["rounded_minutes"] = rounded
+
+        # Calculer le total arrondi
+        total_rounded = sum(g["rounded_minutes"] for g in groups)
+
+        # Ajuster pour atteindre exactement 8h (ou la limite)
+        target = daily_limit
+        diff = target - total_rounded
+
+        if diff != 0 and groups:
+            # Ajuster la plus grande entrée
+            largest = max(groups, key=lambda g: g["rounded_minutes"])
+            largest["rounded_minutes"] = max(30, largest["rounded_minutes"] + diff)
+
+        # Appliquer les arrondis
+        for group in groups:
+            group["adjusted_minutes"] = group["rounded_minutes"]
+            group["kimai_end"] = group["kimai_begin"] + timedelta(minutes=group["adjusted_minutes"])
 
     # Afficher le résumé consolidé
-    display_consolidated(consolidated, shrink_ratios, to_push, date_label, verbose=True)
+    display_consolidated(consolidated, adjustment_ratios, to_push, date_label, verbose=True)
 
-    if config.get("dry_run", True):
-        print("\n[DRY-RUN] Aucun push effectué. Désactivez dry_run dans config.json")
-        return
-
-    if not args.yes:
-        confirm = input("\nConfirmer le push? (y/N) ")
-        if confirm.lower() != 'y':
-            print("Push annulé")
-            return
-
-    # Push vers Kimai (entrées consolidées)
+    # Créer le client Kimai
     client = KimaiClient(
         config["kimai_url"],
         config["auth_user"],
@@ -1014,44 +1304,113 @@ def cmd_push(args):
         dry_run=False
     )
 
+    is_dry_run = config.get("dry_run", True) and not getattr(args, 'force', False)
+
+    if is_dry_run:
+        print("\n[DRY-RUN] Aucun push effectué. Désactivez dry_run dans config.json")
+        if active_sessions_to_close:
+            print(f"[DRY-RUN] {len(active_sessions_to_close)} session(s) active(s) seraient fermées")
+    elif consolidated and not args.yes:
+        confirm = input("\nConfirmer le push? (y/N) ")
+        if confirm.lower() != 'y':
+            print("Push annulé")
+            return
+
     pushed_count = 0
     entries_marked = 0
+    sessions_closed = 0
 
-    for group in consolidated:
-        activity_key = group.get("activity", config.get("default_activity"))
-        activity_id = config["activity_mappings"].get(activity_key, {}).get("id")
+    # Fermer les sessions actives AVANT le push (les ajouter au log)
+    if not is_dry_run and active_sessions_to_close:
+        for sid, entry_data in active_sessions_to_close.items():
+            # Ajouter au log local (pas encore marqué comme pushé)
+            logger.add_entry(entry_data, pushed_to_kimai=False)
+            # Retirer de sessions actives
+            sm.sessions.pop(sid, None)
+            sessions_closed += 1
+        sm._save_all()
+        print(f"\n{sessions_closed} session(s) active(s) fermée(s)")
 
-        if not activity_id:
-            print(f"  ✗ Activité inconnue: {activity_key}")
-            continue
+    if not is_dry_run:
+        for group in consolidated:
+            activity_key = group.get("activity", config.get("default_activity"))
+            activity_id = config["activity_mappings"].get(activity_key, {}).get("id")
 
-        try:
-            result = client.create_timesheet(
-                project_id=group["project_id"],
-                activity_id=activity_id,
-                begin=group["kimai_begin"],
-                end=group["kimai_end"],
-                description=group.get("kimai_description")
-            )
+            if not activity_id:
+                print(f"  [!] Activité inconnue: {activity_key}")
+                continue
 
-            # Marquer toutes les entrées du groupe comme pushées
-            for e in group["entries"]:
-                e["pushed_to_kimai"] = True
-                e["shrunk_minutes"] = group["shrunk_minutes"] if group["ratio"] < 1.0 else None
-                e["consolidated_with"] = len(group["entries"])
-                entries_marked += 1
+            try:
+                result = client.create_timesheet(
+                    project_id=group["project_id"],
+                    activity_id=activity_id,
+                    begin=group["kimai_begin"],
+                    end=group["kimai_end"],
+                    description=group.get("kimai_description")
+                )
 
-            pushed_count += 1
-            h, m = divmod(group['shrunk_minutes'], 60)
-            print(f"  ✓ [{group['date']}] {group['project_name']} / {activity_key} - {h}h{m:02d}")
+                # Marquer toutes les entrées du groupe comme pushées
+                for e in group["entries"]:
+                    e["pushed_to_kimai"] = True
+                    e["adjusted_minutes"] = group["adjusted_minutes"] if group["ratio"] != 1.0 else None
+                    e["adjustment_ratio"] = group["ratio"] if group["ratio"] != 1.0 else None
+                    e["consolidated_with"] = len(group["entries"])
+                    entries_marked += 1
 
-        except Exception as ex:
-            print(f"  ✗ Erreur: {ex}")
+                pushed_count += 1
+                h, m = divmod(group['adjusted_minutes'], 60)
+                print(f"  [OK] [{group['date']}] {group['project_name']} / {activity_key} - {h}h{m:02d}")
+
+            except Exception as ex:
+                print(f"  [ERR] Erreur: {ex}")
 
     # Sauvegarder le log mis à jour
     logger._save()
 
     print(f"\n{pushed_count} timesheets créés ({entries_marked} entrées locales marquées)")
+
+    # Padding si demandé
+    if args.pad:
+        # Dates à traiter : celles des entrées pushées ou la date spécifiée
+        dates_to_pad = list(by_date.keys()) if by_date else []
+        if args.date and args.date not in dates_to_pad:
+            dates_to_pad.append(args.date)
+        if not dates_to_pad:
+            dates_to_pad = [datetime.now().strftime("%Y-%m-%d")]
+
+        for date in dates_to_pad:
+            total_pushed = logger.get_kimai_pushed_minutes(date)
+            missing = daily_limit - total_pushed
+
+            if missing > 0:
+                pad_activity = config.get("pad_activity", "reunion")
+                pad_activity_id = config["activity_mappings"].get(pad_activity, {}).get("id")
+
+                if not pad_activity_id:
+                    print(f"  [!] Activité de padding inconnue: {pad_activity}")
+                    continue
+
+                h, m = divmod(missing, 60)
+                print(f"  → [{date}] Padding {pad_activity} +{h}h{m:02d} (projet {args.pad})")
+
+                if config.get("dry_run", True):
+                    continue
+
+                # Créer un timesheet pour le padding
+                pad_begin = datetime.strptime(date, "%Y-%m-%d").replace(hour=17, minute=0)
+                pad_end = pad_begin + timedelta(minutes=missing)
+
+                try:
+                    client.create_timesheet(
+                        project_id=args.pad,
+                        activity_id=pad_activity_id,
+                        begin=pad_begin,
+                        end=pad_end,
+                        description="Padding automatique"
+                    )
+                    print(f"  [OK] Padding créé")
+                except Exception as ex:
+                    print(f"  [ERR] Erreur padding: {ex}")
 
 
 def cmd_describe(args):
@@ -1169,31 +1528,65 @@ def cmd_activity(args):
         return
 
     session = sm._get_session()
+    folder_type = session.get("folder_type", "pro")
+    activity_mappings = config.get("activity_mappings", {})
 
     if args.activity_key:
-        # Vérifier que l'activité existe
-        activity_mappings = config.get("activity_mappings", {})
-        if args.activity_key not in activity_mappings:
-            print(f"Activité inconnue: {args.activity_key}")
-            print("Activités disponibles:")
-            for key, val in activity_mappings.items():
-                print(f"  {key}: {val.get('name', 'N/A')}")
-            return
+        # Vérifier selon le type de projet
+        if folder_type == "pro":
+            # Projet pro: doit être une activité Kimai connue
+            if args.activity_key not in activity_mappings:
+                print(f"Erreur: Projet PRO - l'activité doit être connue de Kimai.")
+                print("Activités disponibles:")
+                for key, val in activity_mappings.items():
+                    print(f"  {key}: {val.get('name', 'N/A')}")
+                return
 
-        # Mettre à jour l'activité
-        sm.update_activity(estimate=args.activity_key)
-        print(f"Activité changée: {args.activity_key}")
-        print(f"  -> {activity_mappings[args.activity_key].get('name')}")
+            sm.update_activity(estimate=args.activity_key)
+            print(f"Activité changée: {args.activity_key}")
+            print(f"  -> {activity_mappings[args.activity_key].get('name')}")
+
+        else:
+            # Projet local (perso/pending): activité custom acceptée
+            if args.activity_key in activity_mappings:
+                # C'est une clé Kimai connue
+                sm.update_activity(estimate=args.activity_key)
+                print(f"Activité changée: {args.activity_key}")
+                print(f"  -> {activity_mappings[args.activity_key].get('name')}")
+            else:
+                # Activité custom (texte libre)
+                sm.update_activity(estimate=args.activity_key)
+                print(f"Activité custom définie: {args.activity_key}")
+                print("  (Projet LOCAL - activité libre)")
+
     else:
         # Afficher l'activité actuelle
         current = session.get("current_activity_estimate", "non définie")
         breakdown = session.get("activity_breakdown", {})
 
-        print(f"Activité actuelle: {current}")
+        # Vérifier si c'est une activité Kimai ou custom
+        is_kimai = current in activity_mappings
+        type_label = "PRO" if folder_type == "pro" else "LOCAL"
+
+        print(f"Projet: {type_label}")
+        print(f"Activité actuelle: {current}", end="")
+        if is_kimai:
+            print(f" ({activity_mappings[current].get('name')})")
+        else:
+            print(" (custom)")
+
         if breakdown:
             print("Répartition:")
             for act, mins in sorted(breakdown.items(), key=lambda x: -x[1]):
                 print(f"  {act}: ~{mins}min")
+
+        # Aide contextuelle
+        if folder_type == "pro":
+            print("\nActivités Kimai disponibles:")
+            for key in activity_mappings.keys():
+                print(f"  {key}")
+        else:
+            print("\n(Projet local: activité libre acceptée)")
 
 
 def cmd_set(args):
@@ -1204,7 +1597,16 @@ def cmd_set(args):
     project_id = args.project_id
     folder = args.folder or os.getcwd()
     folder = os.path.normpath(folder)
+    custom_activity = getattr(args, 'activity', None)
     sm = SessionManager(folder=folder)
+
+    # Validation: activité custom seulement pour projets locaux
+    if custom_activity and folder_type == "pro":
+        # Vérifier que l'activité est connue de Kimai
+        if custom_activity not in config.get("activity_mappings", {}):
+            print(f"Erreur: Pour un projet 'pro', l'activité doit être connue de Kimai.")
+            print(f"Activités valides: {', '.join(config.get('activity_mappings', {}).keys())}")
+            return
 
     # Récupérer le nom du projet si pro
     project_name = None
@@ -1229,17 +1631,22 @@ def cmd_set(args):
     elif folder_type in ("perso", "pending"):
         project_name = Path(folder).name
 
-    # Sauvegarder le mapping
-    set_folder_mapping(folder, folder_type, project_id, project_name)
+    # Sauvegarder le mapping (custom_activity uniquement pour perso)
+    final_custom = custom_activity if folder_type == "perso" else None
+    set_folder_mapping(folder, folder_type, project_id, project_name, final_custom)
 
-    # Mettre à jour la session en cours si elle existe
-    session = sm._get_session()
-    if session:
-        session["folder_type"] = folder_type
-        session["project_id"] = project_id
-        session["project_name"] = project_name
-        sm._set_session(session)
-        print(f"Session mise à jour: {project_name} ({folder_type})")
+    # Mettre à jour TOUTES les sessions de ce folder
+    folder_sessions = sm.get_folder_sessions()
+    if folder_sessions:
+        for sid, session in folder_sessions.items():
+            session["folder_type"] = folder_type
+            session["project_id"] = project_id
+            session["project_name"] = project_name
+            if final_custom:
+                session["current_activity_estimate"] = final_custom
+            sm.sessions[sid] = session
+        sm._save_all()
+        print(f"{len(folder_sessions)} session(s) mise(s) à jour: {project_name} ({folder_type})")
     else:
         print(f"Mapping enregistré: {folder}")
         print(f"  Type: {folder_type}")
@@ -1248,8 +1655,12 @@ def cmd_set(args):
 
     if folder_type == "pro" and project_id:
         print(f"  -> Les heures seront pushées vers Kimai")
+        if custom_activity:
+            print(f"  -> Activité: {custom_activity}")
     elif folder_type == "perso":
         print(f"  -> Les heures resteront en local")
+        if final_custom:
+            print(f"  -> Activité custom: {final_custom}")
     elif folder_type == "pending":
         print(f"  -> En attente d'un projet Kimai")
     elif folder_type == "off":
@@ -1330,6 +1741,7 @@ def main():
     sp.add_argument("type", choices=["pro", "perso", "pending", "off"], help="Type de projet")
     sp.add_argument("project_id", nargs="?", type=int, help="ID du projet Kimai (pour 'pro')")
     sp.add_argument("--folder", "-f", help="Dossier (défaut: cwd)")
+    sp.add_argument("--activity", "-a", help="Activité custom (perso) ou clé Kimai (pro)")
     sp.set_defaults(func=cmd_set)
 
     # activity
@@ -1343,6 +1755,9 @@ def main():
     sp.add_argument("bridge", nargs="?", default="kimai", help="Bridge cible (défaut: kimai)")
     sp.add_argument("--date", "-d", help="Date (YYYY-MM-DD, défaut: toutes)")
     sp.add_argument("--yes", "-y", action="store_true", help="Confirmer automatiquement")
+    sp.add_argument("--force", "-f", action="store_true", help="Ignorer dry_run et pusher réellement")
+    sp.add_argument("--pad", type=int, metavar="PROJECT_ID", help="Compléter à 8h avec réunion sur ce projet")
+    sp.add_argument("--fill-empty", metavar="START:END", help="Remplir jours vides (ex: 2024-01-01:2024-01-05)")
     sp.set_defaults(func=cmd_push)
 
     # edit

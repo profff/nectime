@@ -186,16 +186,21 @@ def estimate_activity(prompt: str, cwd: str, config: dict) -> str:
             scores[activity] = score
 
     # Regarder les fichiers recemment modifies (< 5 min) dans cwd
+    # Limite: seulement 1 niveau de profondeur pour eviter les scans massifs
     try:
-        import glob
         import time
         now = time.time()
-        for filepath in glob.glob(os.path.join(cwd, "**/*"), recursive=True):
-            if os.path.isfile(filepath):
+        scan_count = 0
+        max_scan = 200  # Limite pour eviter les gros projets
+        for entry in os.scandir(cwd):
+            if scan_count >= max_scan:
+                break
+            if entry.is_file():
+                scan_count += 1
                 try:
-                    mtime = os.path.getmtime(filepath)
+                    mtime = entry.stat().st_mtime
                     if now - mtime < 300:  # 5 minutes
-                        ext = os.path.splitext(filepath)[1].lower()
+                        ext = os.path.splitext(entry.name)[1].lower()
                         for activity, rule in rules.items():
                             if ext in rule.get("extensions", []):
                                 scores[activity] = scores.get(activity, 0) + 1
@@ -277,17 +282,21 @@ def main():
         # Pas de session_id = on ne peut rien faire
         return
 
-    if event == "SessionStart":
-        if source in ("resume", "clear", "compact"):
-            return
-        start_session(cwd, session_id)
+    try:
+        if event == "SessionStart":
+            if source in ("resume", "clear", "compact"):
+                return
+            start_session(cwd, session_id)
 
-    elif event == "SessionEnd":
-        stop_session(cwd, session_id)
+        elif event == "SessionEnd":
+            stop_session(cwd, session_id)
 
-    elif event == "UserPromptSubmit":
-        prompt = hook_input.get('prompt', '')
-        update_activity(cwd, session_id, prompt)
+        elif event == "UserPromptSubmit":
+            prompt = hook_input.get('prompt', '')
+            update_activity(cwd, session_id, prompt)
+    except Exception:
+        # Silencieux - ne jamais bloquer Claude Code
+        pass
 
 
 if __name__ == "__main__":
