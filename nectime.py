@@ -10,8 +10,9 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-import requests
 import subprocess
+
+# 'requests' importé localement dans KimaiClient pour éviter les erreurs si non installé
 
 # Chemins
 SCRIPT_DIR = Path(__file__).parent
@@ -31,6 +32,7 @@ class KimaiClient:
     """Wrapper pour l'API Kimai"""
 
     def __init__(self, url: str, auth_user: str, auth_token: str, dry_run: bool = False):
+        import requests  # Import lazy
         self.url = url.rstrip('/')
         self.auth_user = auth_user
         self.auth_token = auth_token
@@ -135,19 +137,33 @@ class SessionManager:
             json.dump(self.sessions, f, indent=2, default=str)
 
     def _get_session(self) -> Optional[dict]:
-        """Récupère la session courante (par session_id)"""
-        if not self.session_id:
-            return None
-        return self.sessions.get(self.session_id)
+        """Récupère la session courante (par session_id ou fallback folder)"""
+        if self.session_id:
+            return self.sessions.get(self.session_id)
+
+        # Fallback CLI: si une seule session pour ce folder, l'utiliser
+        folder_sessions = {sid: s for sid, s in self.sessions.items()
+                          if s.get("folder") == self.folder}
+        if len(folder_sessions) == 1:
+            self._inferred_sid = list(folder_sessions.keys())[0]
+            return list(folder_sessions.values())[0]
+        return None
+
+    def _get_effective_sid(self) -> Optional[str]:
+        """Retourne le session_id effectif (explicite ou inféré)"""
+        if self.session_id:
+            return self.session_id
+        return getattr(self, '_inferred_sid', None)
 
     def _set_session(self, session_data: Optional[dict]):
         """Définit la session courante"""
-        if not self.session_id:
+        sid = self._get_effective_sid()
+        if not sid:
             return
         if session_data is None:
-            self.sessions.pop(self.session_id, None)
+            self.sessions.pop(sid, None)
         else:
-            self.sessions[self.session_id] = session_data
+            self.sessions[sid] = session_data
         self._save_all()
 
     def is_active(self) -> bool:
@@ -1035,7 +1051,7 @@ def display_consolidated(consolidated: list, adjustment_ratios: dict, to_push: l
                     print(f"      → {desc[:60]}{'...' if len(desc) > 60 else ''}")
             if group.get("git_commits"):
                 n_commits = len(group["git_commits"])
-                print(f"      📝 {n_commits} commit{'s' if n_commits > 1 else ''}: {group['git_commits'][0][:50]}")
+                print(f"      [git] {n_commits} commit{'s' if n_commits > 1 else ''}: {group['git_commits'][0][:50]}")
                 if n_commits > 1:
                     print(f"         ... et {n_commits - 1} autres")
 
@@ -1131,9 +1147,14 @@ def cmd_summary(args):
     adjustment_ratios = {}
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
-        adjustment_ratios[date] = logger.calculate_adjustment_ratio(
-            total_minutes, daily_limit, date=date, expand=True
-        )
+        if is_weekday(date):
+            # Jour de semaine : expand/shrink pour atteindre 8h
+            adjustment_ratios[date] = logger.calculate_adjustment_ratio(
+                total_minutes, daily_limit, date=date, expand=True
+            )
+        else:
+            # Week-end : heures réelles (pas d'ajustement)
+            adjustment_ratios[date] = 1.0
 
     consolidated = consolidate_entries(to_show, adjustment_ratios)
     display_consolidated(consolidated, adjustment_ratios, to_show, date_label, verbose=args.verbose)
@@ -1251,9 +1272,14 @@ def cmd_push(args):
     adjustment_ratios = {}
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
-        adjustment_ratios[date] = logger.calculate_adjustment_ratio(
-            total_minutes, daily_limit, date=date, expand=True
-        )
+        if is_weekday(date):
+            # Jour de semaine : expand/shrink pour atteindre 8h
+            adjustment_ratios[date] = logger.calculate_adjustment_ratio(
+                total_minutes, daily_limit, date=date, expand=True
+            )
+        else:
+            # Week-end : heures réelles (pas d'ajustement)
+            adjustment_ratios[date] = 1.0
 
     # Consolider les entrées
     consolidated = consolidate_entries(to_push, adjustment_ratios)
@@ -1279,14 +1305,15 @@ def cmd_push(args):
         # Calculer le total arrondi
         total_rounded = sum(g["rounded_minutes"] for g in groups)
 
-        # Ajuster pour atteindre exactement 8h (ou la limite)
-        target = daily_limit
-        diff = target - total_rounded
+        # Ajuster pour atteindre exactement 8h (ou la limite) - seulement en semaine
+        if is_weekday(date):
+            target = daily_limit
+            diff = target - total_rounded
 
-        if diff != 0 and groups:
-            # Ajuster la plus grande entrée
-            largest = max(groups, key=lambda g: g["rounded_minutes"])
-            largest["rounded_minutes"] = max(30, largest["rounded_minutes"] + diff)
+            if diff != 0 and groups:
+                # Ajuster la plus grande entrée
+                largest = max(groups, key=lambda g: g["rounded_minutes"])
+                largest["rounded_minutes"] = max(30, largest["rounded_minutes"] + diff)
 
         # Appliquer les arrondis
         for group in groups:

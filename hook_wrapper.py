@@ -17,10 +17,11 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from nectime import (
-    SessionManager, LocalLogger, KimaiClient,
+    SessionManager, LocalLogger,
     load_config, get_folder_mapping, set_folder_mapping, load_folder_mappings,
     get_git_commits
 )
+# KimaiClient importé localement (lazy) pour éviter de charger 'requests' inutilement
 
 
 def format_duration(minutes: int) -> str:
@@ -94,6 +95,7 @@ def start_session(cwd: str, session_id: str):
 
         matches = []
         try:
+            from nectime import KimaiClient  # Import lazy - charge 'requests' uniquement ici
             client = KimaiClient(
                 config["kimai_url"],
                 config["auth_user"],
