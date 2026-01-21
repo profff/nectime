@@ -405,20 +405,22 @@ class LocalLogger:
         entries = self.get_entries(date)
         return sum(e.get("billed_minutes", 0) for e in entries if e.get("pushed_to_kimai"))
 
-    def calculate_adjustment_ratio(self, new_minutes: int, daily_limit: int = 480,
-                                      date: str = None, expand: bool = True) -> float:
+    def calculate_adjustment_ratio(self, new_minutes: int, expand_limit: int = 480,
+                                      shrink_limit: int = 720, date: str = None,
+                                      expand: bool = True) -> float:
         """
-        Calcule le ratio d'ajustement pour atteindre la limite journalière.
+        Calcule le ratio d'ajustement pour atteindre les limites journalières.
 
-        - Si total > limit : shrink (ratio < 1)
-        - Si total < limit et expand=True : expand (ratio > 1)
-        - Sinon : ratio = 1.0
+        - Si total > shrink_limit : shrink (ratio < 1) pour atteindre shrink_limit
+        - Si total < expand_limit et expand=True : expand (ratio > 1) pour atteindre expand_limit
+        - Si entre expand_limit et shrink_limit : ratio = 1.0 (heures réelles)
 
         Args:
             new_minutes: Minutes à ajouter
-            daily_limit: Limite en minutes (défaut: 480 = 8h)
+            expand_limit: Limite basse en minutes (défaut: 480 = 8h) - on expand vers cette valeur
+            shrink_limit: Limite haute en minutes (défaut: 720 = 12h) - on shrink vers cette valeur
             date: Date concernée (défaut: aujourd'hui)
-            expand: Autoriser l'expansion si < limit
+            expand: Autoriser l'expansion si < expand_limit
 
         Returns:
             Ratio à appliquer
@@ -432,21 +434,24 @@ class LocalLogger:
             return 1.0
 
         total_if_pushed = already_pushed + new_minutes
-        remaining_capacity = max(0, daily_limit - already_pushed)
+        remaining_for_shrink = max(0, shrink_limit - already_pushed)
+        remaining_for_expand = max(0, expand_limit - already_pushed)
 
-        if total_if_pushed > daily_limit:
-            # Shrink: trop d'heures
-            return remaining_capacity / new_minutes
-        elif expand and total_if_pushed < daily_limit and remaining_capacity > 0:
-            # Expand: pas assez d'heures, grossir pour atteindre la limite
-            return remaining_capacity / new_minutes
+        if total_if_pushed > shrink_limit:
+            # Shrink: trop d'heures, réduire vers shrink_limit
+            return remaining_for_shrink / new_minutes
+        elif expand and total_if_pushed < expand_limit and remaining_for_expand > 0:
+            # Expand: pas assez d'heures, grossir pour atteindre expand_limit
+            return remaining_for_expand / new_minutes
         else:
+            # Entre expand_limit et shrink_limit : garder les heures réelles
             return 1.0
 
     # Alias pour rétrocompatibilité
-    def calculate_shrink_ratio(self, new_minutes: int, daily_limit: int = 480) -> float:
+    def calculate_shrink_ratio(self, new_minutes: int, shrink_limit: int = 720) -> float:
         """Alias vers calculate_adjustment_ratio (shrink only)"""
-        return self.calculate_adjustment_ratio(new_minutes, daily_limit, expand=False)
+        return self.calculate_adjustment_ratio(new_minutes, expand_limit=shrink_limit,
+                                               shrink_limit=shrink_limit, expand=False)
 
     def fill_empty_weekdays(self, start_date: str, end_date: str) -> list:
         """
@@ -1143,14 +1148,16 @@ def cmd_summary(args):
             by_date[d] = []
         by_date[d].append(e)
 
-    daily_limit = config.get("daily_limit_hours", 8) * 60
+    expand_limit = config.get("expand_limit_hours", 8) * 60
+    shrink_limit = config.get("shrink_limit_hours", 12) * 60
     adjustment_ratios = {}
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
         if is_weekday(date):
-            # Jour de semaine : expand/shrink pour atteindre 8h
+            # Jour de semaine : expand vers 8h, shrink vers 12h
             adjustment_ratios[date] = logger.calculate_adjustment_ratio(
-                total_minutes, daily_limit, date=date, expand=True
+                total_minutes, expand_limit=expand_limit, shrink_limit=shrink_limit,
+                date=date, expand=True
             )
         else:
             # Week-end : heures réelles (pas d'ajustement)
@@ -1266,16 +1273,20 @@ def cmd_push(args):
             by_date[d] = []
         by_date[d].append(e)
 
-    daily_limit = config.get("daily_limit_hours", 8) * 60
+    expand_limit = config.get("expand_limit_hours", 8) * 60
+    shrink_limit = config.get("shrink_limit_hours", 12) * 60
 
     # Calculer les ratios d'ajustement par jour (shrink ou expand)
     adjustment_ratios = {}
+    original_totals = {}  # Garder trace des totaux originaux
     for date, day_entries in by_date.items():
         total_minutes = sum(e.get("billed_minutes", 0) for e in day_entries)
+        original_totals[date] = total_minutes
         if is_weekday(date):
-            # Jour de semaine : expand/shrink pour atteindre 8h
+            # Jour de semaine : expand vers 8h, shrink vers 12h
             adjustment_ratios[date] = logger.calculate_adjustment_ratio(
-                total_minutes, daily_limit, date=date, expand=True
+                total_minutes, expand_limit=expand_limit, shrink_limit=shrink_limit,
+                date=date, expand=True
             )
         else:
             # Week-end : heures réelles (pas d'ajustement)
@@ -1284,7 +1295,7 @@ def cmd_push(args):
     # Consolider les entrées
     consolidated = consolidate_entries(to_push, adjustment_ratios)
 
-    # Arrondir à 30 min pour le push Kimai, en respectant le total de 8h/jour
+    # Arrondir à 30 min pour le push Kimai
     # Grouper par date
     by_date_consolidated = {}
     for group in consolidated:
@@ -1305,9 +1316,16 @@ def cmd_push(args):
         # Calculer le total arrondi
         total_rounded = sum(g["rounded_minutes"] for g in groups)
 
-        # Ajuster pour atteindre exactement 8h (ou la limite) - seulement en semaine
+        # Ajuster pour atteindre la cible - seulement en semaine
         if is_weekday(date):
-            target = daily_limit
+            orig_total = original_totals.get(date, 0)
+            # Déterminer la cible selon le total original
+            if orig_total < expand_limit:
+                target = expand_limit  # Expand vers 8h
+            elif orig_total > shrink_limit:
+                target = shrink_limit  # Shrink vers 12h
+            else:
+                target = total_rounded  # Entre 8h et 12h : garder le total arrondi
             diff = target - total_rounded
 
             if diff != 0 and groups:
@@ -1407,7 +1425,7 @@ def cmd_push(args):
 
         for date in dates_to_pad:
             total_pushed = logger.get_kimai_pushed_minutes(date)
-            missing = daily_limit - total_pushed
+            missing = expand_limit - total_pushed  # Padding jusqu'à expand_limit (8h)
 
             if missing > 0:
                 pad_activity = config.get("pad_activity", "reunion")
